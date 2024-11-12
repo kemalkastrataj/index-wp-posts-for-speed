@@ -21,14 +21,22 @@ if ( ! defined( 'WPINC' ) ) {
 }
 
 define( 'INDEX_WP_POSTS_FOR_SPEED_VERSION', '0.0.1' );
+define( 'INDEX_WP_POSTS_FOR_SPEED_SLUG', 'index-wp-posts-for-speed' );
+
 
 /**
  * The code that runs during plugin activation.
  * This action is documented in includes/class-index-wp-posts-for-speed-activator.php
  */
 function activate() {
-	require_once plugin_dir_path( __FILE__ ) . 'includes/class-index-wp-posts-for-speed-activator.php';
-	Index_WP_Posts_For_Speed_Activator::activate();
+
+	register_uninstall_hook( __FILE__, 'Index_WP_Posts_For_Speed\uninstall' );
+	require_once( plugin_dir_path( __FILE__ ) . 'includes/class-textdex.php' );
+	$textdex = new Textdex();
+	$textdex->unit_test();
+	//HACK HACK	$textdex->activate();
+	//HACK HACK	$textdex->get_order_id_range();
+	//HACK HACK	$textdex->load_textdex();
 }
 
 /**
@@ -36,9 +44,9 @@ function activate() {
  * This action is documented in includes/class-index-wp-posts-for-speed-deactivator.php
  */
 function deactivate() {
-	require_once plugin_dir_path( __FILE__ ) . 'includes/class-index-wp-posts-for-speed-deactivator.php';
-	Index_WP_Posts_For_Speed_Deactivator::deactivate();
-}
+	require_once( plugin_dir_path( __FILE__ ) . 'includes/class-textdex.php' );
+	$textdex = new Textdex();
+	$textdex->deactivate();}
 
 register_activation_hook( __FILE__, 'Index_WP_Posts_For_Speed\activate' );
 register_deactivation_hook( __FILE__, 'Index_WP_Posts_For_Speed\deactivate' );
