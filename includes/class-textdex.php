@@ -4,7 +4,9 @@
 
 namespace Index_WP_Posts_For_Speed;
 
+use DOMDocument;
 use stdClass;
+use WP_Post;
 use WP_Query;
 
 class Textdex {
@@ -16,7 +18,7 @@ class Textdex {
 	/** @var int The maximum number of tuples per insert */
 	private $trigram_batch_size = 250;
 	/** @var int The number of posts per metadata query batch. */
-	private $batch_size = 200;
+	private $batch_size = 10;
 
 	private $attempted_inserts = 0;
 	private $actual_inserts = 0;
@@ -25,7 +27,7 @@ class Textdex {
 	/**
 	 * @var int|null
 	 */
-	private $first;
+	private $last_id_processed;
 	/**
 	 * @var int|null
 	 */
@@ -196,13 +198,11 @@ TABLE;
 	 */
 	public function posts_clauses( $clauses, $query ) {
 		global $wpdb;
-		if ( null !== $this->first ) {
-			$clauses['where'] .= $wpdb->prepare( " AND ID >= %d", $this->first );
+		$last_id_processed = $query->query['last_id_processed'] ?? null;
+		if ( null !== $last_id_processed ) {
+			$clauses['where'] .= $wpdb->prepare( " AND ID > %d", $this->last_id_processed );
 		}
-		if ( null !== $this->last ) {
-			$clauses['where'] .= $wpdb->prepare( " AND ID < %d", $this->last );
-		}
-		remove_filter( 'post_clauses', [ $this, 'post_clauses' ], 10 );
+		remove_filter( 'posts_clauses', [ $this, 'post_clauses' ], 10 );
 
 		return $clauses;
 	}
@@ -215,24 +215,20 @@ TABLE;
 	private function load_next_batch() {
 		global $post;
 		$textdex_status = $this->get_option();
-		if ( true === $textdex_status['done'] ) {
+		if ( true === $textdex_status['done'] ) {  //HACK HACK
 			return false;
 		}
-		if ( array_key_exists( 'new', $textdex_status ) ) {
-			$args  = array(
-				'post_type'      => 'any',
-			);
-			list ($this->first, $this->last) = $this->get_first_and_last_ids( $args );
-
-			$textdex_status['new'] = false;
-
-		}
 		$args = array(
-			'post_type'     => 'any',
-			'nopaging'      => 'true',
-			'orderby'       => 'ID',
-			'no_found_rows' => true
+			'post_type'         => 'any',
+			'orderby'           => 'ID',
+			'order'             => 'ASC',
+			'no_found_rows'     => true,
+			'posts_per_page'    => $textdex_status['batch'],
+			'last_id_processed' => $textdex_status['last_id_processed'],
 		);
+		if ( array_key_exists( 'new', $textdex_status ) ) {
+			$args['no_found_rows'] = false;
+		}
 
 		global $wpdb;
 
@@ -241,63 +237,38 @@ TABLE;
 		$query = new WP_Query( $args );
 		$posts = $query->get_posts();
 
-		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery,WordPress.DB.DirectDatabaseQuery.NoCaching
-		$wpdb->query( 'BEGIN;' );
+		if ( is_array( $posts ) && count( $posts ) > 0 ) {
 
-		return;
-		$resultset = $this->get_order_metadata( $first, $last );
-		$trigrams  = array();
-		foreach ( $this->get_trigrams( $resultset ) as $trigram ) {
-			$trigrams[ $wpdb->prepare( '(%s,%d)', $trigram[0], $trigram[1] ) ] = 1;
-			if ( count( $trigrams ) >= $trigram_count ) {
-				$this->do_insert_statement( $trigrams );
-				$trigrams = array();
+			if ( array_key_exists( 'new', $textdex_status ) ) {
+				$textdex_status['post_count'] = $query->found_posts;
+				unset ( $textdex_status['new'] );
 			}
+
+			$wpdb->query( 'BEGIN;' );
+
+			$trigrams      = array();
+			$trigram_batch = $textdex_status['trigram_batch'];
+			foreach ( $this->get_trigrams( $posts ) as $trigram ) {
+				$trigrams[ $wpdb->prepare( '(%s,%d)', $trigram[0], $trigram[1] ) ] = 1;
+				if ( count( $trigrams ) >= $trigram_batch ) {
+					$this->do_insert_statement( $trigrams );
+					$trigrams = array();
+				}
+			}
+			$this->do_insert_statement( $trigrams );
+			unset ( $trigrams );
+			// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery,WordPress.DB.DirectDatabaseQuery.NoCaching
+			$wpdb->query( 'COMMIT;' );
+			$post                                = $posts[ count( $posts ) - 1 ];
+			$textdex_status['last_id_processed'] = $post->ID;
+			unset( $posts );
+			$this->update_option( $textdex_status );
+
+			return false;
+		} else {
+			/* Nothing left, excellent */
+			return true;
 		}
-		$this->do_insert_statement( $trigrams );
-		unset ( $resultset, $trigrams );
-		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery,WordPress.DB.DirectDatabaseQuery.NoCaching
-		$wpdb->query( 'COMMIT;' );
-		$textdex_status['current'] = $last;
-		$this->update_option( $textdex_status );
-
-		return $textdex_status['current'] < $textdex_status['last'];
-	}
-
-
-	/**
-	 * @param $args array WP_Query args for the present search
-	 *
-	 * @return int[] the first and last IDs
-	 */
-	public function get_first_and_last_ids( $args ) {
-		$first = 0;
-		$last  = 0;
-		/* get the first and last post.ID values to use. */
-		$argv = array_merge( $args,
-			array(
-				'orderby'        => 'ID',
-				'order'          => 'ASC',
-				'no_found_rows'  => true,
-				'fields'         => 'ids',
-				'posts_per_page' => 1,
-			) );
-
-		$query = new WP_Query( $argv );
-		$ids   = $query->get_posts();
-		if ( is_array( $ids ) && count( $ids ) >= 1 ) {
-			$first = $ids[0];
-		}
-
-		$argv['order'] = 'DESC';
-		$query         = new WP_Query( $argv );
-		$ids           = $query->get_posts();
-		if ( is_array( $ids ) && count( $ids ) >= 1 ) {
-			$last = $ids[0];
-		}
-
-		return array( $first, $last );
-
 	}
 
 	/**
@@ -307,29 +278,37 @@ TABLE;
 		return ! $this->have_more_batches( $fuzz_factor );
 	}
 
-	public function is_order_meta_key( $meta_key ) {
-		return array_key_exists( $meta_key, $this->meta_keys_to_monitor );
-	}
+	/**
+	 * @param WP_Post[] $posts
+	 *
+	 * @return \Generator
+	 */
+	private function get_trigrams( $posts ) {
 
+		foreach ( $posts as $post ) {
 
-	private function get_trigrams( $resultset ) {
+			$internal_errors         = libxml_use_internal_errors( true );
+			$doc                     = new DOMDocument( '1.0', 'utf-8' );
+			$doc->preserveWhiteSpace = false;
+			$doc->loadHTML( $post->post_content, LIBXML_NOWARNING );
+			libxml_use_internal_errors( $internal_errors );
 
-		if ( is_string( $resultset ) ) {
-			$resultset = array( (object) array( 'id' => 1, 'value' => $resultset ) );
-		}
-		foreach ( $resultset as $row ) {
-			$id    = $row->id;
-			$value = $row->value;
-			if ( ! is_string( $value ) ) {
-				continue;
-			}
-			$value = trim( $value );
-			if ( mb_strlen( $value ) <= 0 ) {
-				continue;
-			}
-			$value = mb_ereg_replace( '\s+', ' ', $value );
-			$value = trim( $value );
-			$len   = mb_strlen( $value );
+			$s   = array();
+			$s[] = $doc->textContent;
+			unset ( $doc );
+			$s[] = $post->post_excerpt;
+			$s[] = $post->post_title;
+
+			$s     = array_map( function ( $str ) {
+				$s = mb_ereg_replace( '[[:punct:][:space:]=]+', ' ', $str, 'p' );
+				$str = mb_ereg_replace( '[\r\n\s \t]+', ' ', $str, 'p' );
+				$s = trim( $s );
+
+				return ( ! is_string( $s ) || 0 === mb_strlen( $s ) ) ? false : $s;
+			}, $s );
+			$value = implode( ' ', array_filter( $s ) );
+
+			$len = mb_strlen( $value );
 			if ( $len <= 0 ) {
 				continue;
 			} else if ( 1 === $len ) {
@@ -340,7 +319,7 @@ TABLE;
 			$len = mb_strlen( $value ) - 2;
 			if ( $len > 0 ) {
 				for ( $i = 0; $i < $len; $i ++ ) {
-					yield array( mb_substr( $value, $i, 3 ), $id );
+					yield array( mb_substr( $value, $i, 3 ), $post->ID );
 				}
 			}
 		}
@@ -607,13 +586,13 @@ QUERY;
 	private function get_option() {
 		return get_option( $this->option_name,
 			array(
-				'new'           => true,
-				'current'       => 0,
-				'batch'         => $this->batch_size,
-				'trigram_batch' => $this->trigram_batch_size,
-				'last'          => - 1,
-				'version'       => INDEX_WP_POSTS_FOR_SPEED_VERSION,
-				'done'          => false,
+				'new'               => true,
+				'current'           => 0,
+				'batch'             => $this->batch_size,
+				'trigram_batch'     => $this->trigram_batch_size,
+				'last_id_processed' => null,
+				'version'           => INDEX_WP_POSTS_FOR_SPEED_VERSION,
+				'done'              => false,
 			) );
 	}
 
